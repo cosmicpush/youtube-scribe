@@ -5,12 +5,10 @@ services:
     image: ghcr.io/cosmicpush/youtube-scribe:latest
     ports:
       - "3000:3000"
-      - "8000:8000"
     volumes:
       - scribe-data:/app/data
     environment:
       - DATA_DIR=/app/data
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
       - TZ=Asia/Kolkata
     restart: unless-stopped
 

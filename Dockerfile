@@ -47,7 +47,6 @@ RUN chmod +x ./start.sh
 
 ENV DATA_DIR=/app/data
 ENV NODE_ENV=production
-ENV NEXT_PUBLIC_API_URL=http://localhost:8000
 
 EXPOSE 3000 8000
 
