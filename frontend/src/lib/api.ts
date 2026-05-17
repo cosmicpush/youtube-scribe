@@ -33,6 +33,16 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+export async function apiPostForm<T>(path: string, form: FormData): Promise<T> {
+  // Do NOT set Content-Type — the browser fills in the multipart boundary.
+  const res = await fetch(path, { method: "POST", body: form });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(data.detail || res.statusText);
+  }
+  return res.json();
+}
+
 export function downloadUrl(path: string): string {
   return path;
 }

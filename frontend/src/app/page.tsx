@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import Image from "next/image";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -12,6 +12,7 @@ import { Switch } from "@/components/ui/switch";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Select,
   SelectContent,
@@ -19,7 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { apiPost, apiGet, downloadUrl } from "@/lib/api";
+import { apiPost, apiPostForm, apiGet, downloadUrl } from "@/lib/api";
 import {
   Loader2,
   FileText,
@@ -28,6 +29,9 @@ import {
   AlertCircle,
   CheckCircle2,
   RotateCcw,
+  Cookie,
+  Upload,
+  X,
 } from "lucide-react";
 
 interface VideoInfo {
@@ -43,6 +47,7 @@ interface Job {
   status: string;
   progress: string;
   youtube_url: string;
+  source?: string;
   video_info: VideoInfo | null;
   transcript_text: string | null;
   transcript_srt: string | null;
@@ -51,6 +56,7 @@ interface Job {
 
 const STATUS_PROGRESS: Record<string, number> = {
   downloading: 20,
+  processing: 25,
   uploading: 40,
   transcribing: 70,
   completed: 100,
@@ -65,14 +71,27 @@ function formatDuration(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
 export default function HomePage() {
+  const [mode, setMode] = useState<string>("url");
   const [url, setUrl] = useState("");
+  const [cookiesFile, setCookiesFile] = useState<File | null>(null);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
   const [languageHints, setLanguageHints] = useState("en,hi");
   const [diarization, setDiarization] = useState(false);
   const [translateToEnglish, setTranslateToEnglish] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  const cookiesInputRef = useRef<HTMLInputElement>(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
 
   const pollJob = useCallback(async (jobId: string) => {
     try {
@@ -92,7 +111,7 @@ export default function HomePage() {
       .then((data) => {
         if (data && data.id) {
           setJob(data);
-          setUrl(data.youtube_url || "");
+          if (data.source !== "upload") setUrl(data.youtube_url || "");
           if (data.status !== "completed" && data.status !== "error") {
             pollJob(data.id);
           }
@@ -101,6 +120,13 @@ export default function HomePage() {
       .catch(() => {});
   }, [pollJob]);
 
+  const resetSelections = () => {
+    setCookiesFile(null);
+    setVideoFile(null);
+    if (cookiesInputRef.current) cookiesInputRef.current.value = "";
+    if (videoInputRef.current) videoInputRef.current.value = "";
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
@@ -108,26 +134,33 @@ export default function HomePage() {
     setSubmitting(true);
 
     try {
-      const hints = languageHints
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const data = await apiPost<{ job_id: string }>("/api/transcribe", {
-        youtube_url: url,
-        language_hints: hints,
-        enable_speaker_diarization: diarization,
-        translate_to_english: translateToEnglish,
-      });
+      const form = new FormData();
+      form.append("language_hints", languageHints);
+      form.append("enable_speaker_diarization", String(diarization));
+      form.append("translate_to_english", String(translateToEnglish));
+
+      if (mode === "url") {
+        if (!url.trim()) throw new Error("Please enter a YouTube URL.");
+        form.append("youtube_url", url.trim());
+        if (cookiesFile) form.append("cookies_file", cookiesFile);
+      } else {
+        if (!videoFile) throw new Error("Please choose a video file to upload.");
+        form.append("video_file", videoFile);
+      }
+
+      const data = await apiPostForm<{ job_id: string }>("/api/transcribe", form);
       setJob({
         id: data.job_id,
-        status: "downloading",
+        status: mode === "url" ? "downloading" : "processing",
         progress: "Starting...",
-        youtube_url: url,
+        youtube_url: mode === "url" ? url : videoFile?.name || "Uploaded video",
+        source: mode === "url" ? "youtube" : "upload",
         video_info: null,
         transcript_text: null,
         transcript_srt: null,
         error: null,
       });
+      resetSelections();
       pollJob(data.job_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start transcription");
@@ -148,41 +181,121 @@ export default function HomePage() {
   };
 
   const isProcessing = job && job.status !== "completed" && job.status !== "error";
+  const canSubmit =
+    !isProcessing && !submitting && (mode === "url" ? !!url : !!videoFile);
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8">
       <div className="mb-8">
-        <h1 className="text-2xl font-semibold tracking-tight">Transcribe a YouTube Video</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">Transcribe a Video</h1>
         <p className="text-muted-foreground mt-1 text-sm">
-          Paste a YouTube link below to get a full transcript powered by Soniox AI.
+          Paste a YouTube link or upload a video file to get a full transcript powered by Soniox AI.
         </p>
       </div>
 
       <Card className="p-6">
         <form onSubmit={handleSubmit} className="space-y-6">
-          <div className="space-y-2">
-            <Label htmlFor="url">YouTube URL</Label>
-            <div className="flex gap-2">
-              <Input
-                id="url"
-                type="url"
-                placeholder="https://www.youtube.com/watch?v=..."
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                required
-                disabled={!!isProcessing}
-                className="flex-1"
-              />
-              <Button type="submit" disabled={!url || !!isProcessing || submitting}>
-                {submitting ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Play className="h-4 w-4" />
+          <Tabs value={mode} onValueChange={(v) => v && setMode(v)}>
+            <TabsList>
+              <TabsTrigger value="url" disabled={!!isProcessing}>
+                YouTube URL
+              </TabsTrigger>
+              <TabsTrigger value="upload" disabled={!!isProcessing}>
+                Upload File
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="url" className="space-y-4 pt-2">
+              <div className="space-y-2">
+                <Label htmlFor="url">YouTube URL</Label>
+                <Input
+                  id="url"
+                  type="url"
+                  placeholder="https://www.youtube.com/watch?v=..."
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  disabled={!!isProcessing}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="cookies" className="flex items-center gap-1.5">
+                  <Cookie className="h-3.5 w-3.5" />
+                  Cookies file <span className="text-muted-foreground">(optional)</span>
+                </Label>
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="cookies"
+                    ref={cookiesInputRef}
+                    type="file"
+                    accept=".txt"
+                    onChange={(e) => setCookiesFile(e.target.files?.[0] || null)}
+                    disabled={!!isProcessing}
+                    className="file:text-foreground file:mr-3 file:rounded-md file:border-0 file:bg-transparent file:text-sm"
+                  />
+                  {cookiesFile && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => {
+                        setCookiesFile(null);
+                        if (cookiesInputRef.current) cookiesInputRef.current.value = "";
+                      }}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  )}
+                </div>
+                <p className="text-muted-foreground text-xs">
+                  Netscape-format cookies.txt for private or age-restricted videos. Deleted after the
+                  job finishes.
+                </p>
+              </div>
+            </TabsContent>
+
+            <TabsContent value="upload" className="space-y-4 pt-2">
+              <div className="space-y-2">
+                <Label htmlFor="video" className="flex items-center gap-1.5">
+                  <Upload className="h-3.5 w-3.5" />
+                  Video or audio file
+                </Label>
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="video"
+                    ref={videoInputRef}
+                    type="file"
+                    accept="video/*,audio/*"
+                    onChange={(e) => setVideoFile(e.target.files?.[0] || null)}
+                    disabled={!!isProcessing}
+                    className="file:text-foreground file:mr-3 file:rounded-md file:border-0 file:bg-transparent file:text-sm"
+                  />
+                  {videoFile && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => {
+                        setVideoFile(null);
+                        if (videoInputRef.current) videoInputRef.current.value = "";
+                      }}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  )}
+                </div>
+                {videoFile && (
+                  <p className="text-muted-foreground text-xs">
+                    {videoFile.name} — {formatBytes(videoFile.size)}
+                  </p>
                 )}
-                <span className="ml-2">{submitting ? "Starting..." : "Transcribe"}</span>
-              </Button>
-            </div>
-          </div>
+                <p className="text-muted-foreground text-xs">
+                  Audio is extracted with ffmpeg and uploaded to Soniox. Your file is deleted from the
+                  server after transcription.
+                </p>
+              </div>
+            </TabsContent>
+          </Tabs>
 
           <Separator />
 
@@ -218,6 +331,17 @@ export default function HomePage() {
                 Translate to English
               </Label>
             </div>
+          </div>
+
+          <div className="flex justify-end">
+            <Button type="submit" disabled={!canSubmit}>
+              {submitting ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+              <span className="ml-2">{submitting ? "Starting..." : "Transcribe"}</span>
+            </Button>
           </div>
         </form>
       </Card>

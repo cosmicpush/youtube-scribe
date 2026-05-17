@@ -4,8 +4,9 @@ import logging
 import os
 import uuid
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -13,7 +14,7 @@ from pydantic import BaseModel
 from config import load_config, save_config
 from soniox_client import SonioxTranscriber
 from transcript_formatter import tokens_to_srt, tokens_to_text
-from youtube import extract_audio
+from youtube import extract_audio, transcode_to_mp3
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,16 +32,12 @@ app.add_middleware(
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 AUDIO_DIR = DATA_DIR / "audio"
 JOBS_DIR = DATA_DIR / "jobs"
+UPLOADS_DIR = DATA_DIR / "uploads"
+
+UPLOAD_CHUNK = 1024 * 1024  # 1 MiB streaming chunks
 
 # In-memory job tracking
 jobs: dict[str, dict] = {}
-
-
-class TranscribeRequest(BaseModel):
-    youtube_url: str
-    language_hints: list[str] = ["en", "hi"]
-    enable_speaker_diarization: bool = False
-    translate_to_english: bool = False
 
 
 class ConfigUpdate(BaseModel):
@@ -50,20 +47,21 @@ class ConfigUpdate(BaseModel):
     translation_mode: str | None = None
 
 
-# --- Startup: clean up orphaned audio files ---
+# --- Startup: clean up orphaned files ---
 
 
 @app.on_event("startup")
-async def cleanup_orphaned_audio():
-    """Remove any leftover audio files from previous runs."""
-    if AUDIO_DIR.exists():
-        count = 0
-        for f in AUDIO_DIR.iterdir():
-            if f.is_file():
-                f.unlink()
-                count += 1
-        if count:
-            logger.info(f"Startup cleanup: removed {count} orphaned audio file(s)")
+async def cleanup_orphaned_files():
+    """Remove leftover audio/upload files from previous runs."""
+    for directory, label in ((AUDIO_DIR, "audio"), (UPLOADS_DIR, "upload")):
+        if directory.exists():
+            count = 0
+            for f in directory.iterdir():
+                if f.is_file():
+                    f.unlink()
+                    count += 1
+            if count:
+                logger.info(f"Startup cleanup: removed {count} orphaned {label} file(s)")
 
     # Mark any jobs that were in-progress as crashed so UI can show retry
     if JOBS_DIR.exists():
@@ -71,7 +69,7 @@ async def cleanup_orphaned_audio():
             try:
                 with open(job_file) as f:
                     data = json.load(f)
-                if data.get("status") in ("downloading", "uploading", "transcribing", "retrying"):
+                if data.get("status") in ("downloading", "processing", "uploading", "transcribing", "retrying"):
                     data["status"] = "error"
                     data["error"] = "Server restarted while this job was running. Click Retry to resume."
                     data["progress"] = "Error: Server restarted"
@@ -119,28 +117,79 @@ def get_raw_api_key():
 # --- Transcription endpoints ---
 
 
+async def _stream_upload_to_disk(upload: UploadFile, dest: Path) -> None:
+    with open(dest, "wb") as out:
+        while True:
+            chunk = await upload.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            out.write(chunk)
+
+
 @app.post("/api/transcribe")
-async def transcribe(req: TranscribeRequest):
+async def transcribe(
+    youtube_url: Optional[str] = Form(None),
+    language_hints: str = Form("en,hi"),
+    enable_speaker_diarization: bool = Form(False),
+    translate_to_english: bool = Form(False),
+    cookies_file: Optional[UploadFile] = File(None),
+    video_file: Optional[UploadFile] = File(None),
+):
     config = load_config()
     api_key = config.get("soniox_api_key", "")
     if not api_key:
         raise HTTPException(status_code=400, detail="Soniox API key not configured. Go to Settings.")
 
+    has_url = bool(youtube_url and youtube_url.strip())
+    has_video = bool(video_file and video_file.filename)
+    if not has_url and not has_video:
+        raise HTTPException(status_code=400, detail="Provide either a YouTube URL or a video file.")
+    if has_url and has_video:
+        raise HTTPException(status_code=400, detail="Provide either a YouTube URL or a video file, not both.")
+
     job_id = str(uuid.uuid4())[:8]
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+    cookies_path: Path | None = None
+    if cookies_file and cookies_file.filename:
+        cookies_path = UPLOADS_DIR / f"{job_id}_cookies.txt"
+        await _stream_upload_to_disk(cookies_file, cookies_path)
+
+    uploaded_video_path: Path | None = None
+    original_filename: str | None = None
+    if has_video:
+        original_filename = video_file.filename
+        ext = Path(original_filename or "video.mp4").suffix or ".mp4"
+        uploaded_video_path = UPLOADS_DIR / f"{job_id}_video{ext}"
+        await _stream_upload_to_disk(video_file, uploaded_video_path)
+
+    hints = [s.strip() for s in language_hints.split(",") if s.strip()] or ["en"]
+    source = "youtube" if has_url else "upload"
+    display_url = youtube_url.strip() if has_url else (original_filename or "Uploaded video")
+
     jobs[job_id] = {
         "id": job_id,
-        "status": "downloading",
-        "progress": "Downloading YouTube audio...",
-        "youtube_url": req.youtube_url,
+        "status": "downloading" if source == "youtube" else "processing",
+        "progress": "Downloading YouTube audio..." if source == "youtube" else "Extracting audio from upload...",
+        "youtube_url": display_url,
+        "source": source,
         "video_info": None,
         "transcript_text": None,
         "transcript_srt": None,
         "tokens": None,
         "error": None,
-        # Internal state for retry
         "_audio_path": None,
         "_file_id": None,
-        "_request": req.model_dump(),
+        "_cookies_path": str(cookies_path) if cookies_path else None,
+        "_uploaded_video_path": str(uploaded_video_path) if uploaded_video_path else None,
+        "_original_filename": original_filename,
+        "_request": {
+            "youtube_url": youtube_url.strip() if has_url else "",
+            "language_hints": hints,
+            "enable_speaker_diarization": enable_speaker_diarization,
+            "translate_to_english": translate_to_english,
+            "source": source,
+        },
     }
 
     asyncio.create_task(_run_transcription(job_id, api_key))
@@ -179,19 +228,46 @@ async def _run_transcription(job_id: str, api_key: str):
     # Recover state from previous attempt
     audio_path: Path | None = Path(job["_audio_path"]) if job.get("_audio_path") else None
     file_id: str | None = job.get("_file_id")
+    cookies_path: Path | None = Path(job["_cookies_path"]) if job.get("_cookies_path") else None
+    uploaded_video_path: Path | None = (
+        Path(job["_uploaded_video_path"]) if job.get("_uploaded_video_path") else None
+    )
+    source = req_data.get("source", "youtube")
     transcription_id: str | None = None
 
     try:
-        # Step 1: Download audio (skip if already downloaded)
+        # Step 1: Get audio (download from YouTube OR transcode upload)
         if audio_path and audio_path.exists():
             logger.info(f"Job {job_id}: reusing cached audio {audio_path}")
-            _update_job_status(job_id, job, "uploading", "Audio already downloaded, resuming...")
-        else:
+            _update_job_status(job_id, job, "uploading", "Audio already ready, resuming...")
+        elif source == "youtube":
             _update_job_status(job_id, job, "downloading", "Downloading YouTube audio...")
-            audio_path, video_info = await extract_audio(req_data["youtube_url"], AUDIO_DIR)
+            audio_path, video_info = await extract_audio(
+                req_data["youtube_url"],
+                AUDIO_DIR,
+                cookies_path=cookies_path,
+            )
             job["video_info"] = video_info
             job["_audio_path"] = str(audio_path)
             _save_job(job_id, job)
+            # Cookies served their purpose
+            if cookies_path and cookies_path.exists():
+                cookies_path.unlink(missing_ok=True)
+                job["_cookies_path"] = None
+        else:
+            if not uploaded_video_path or not uploaded_video_path.exists():
+                raise FileNotFoundError("Uploaded video file is missing — please re-upload.")
+            _update_job_status(job_id, job, "processing", "Extracting audio from uploaded video...")
+            title_hint = job.get("_original_filename") or "Uploaded video"
+            audio_path, video_info = await transcode_to_mp3(
+                uploaded_video_path, AUDIO_DIR, job_id, display_title=title_hint,
+            )
+            job["video_info"] = video_info
+            job["_audio_path"] = str(audio_path)
+            _save_job(job_id, job)
+            # Source video no longer needed
+            uploaded_video_path.unlink(missing_ok=True)
+            job["_uploaded_video_path"] = None
 
         # Step 2: Upload to Soniox (skip if already uploaded)
         if file_id:
@@ -224,7 +300,7 @@ async def _run_transcription(job_id: str, api_key: str):
         job["transcript_srt"] = tokens_to_srt(tokens)
         _update_job_status(job_id, job, "completed", "Done!")
 
-        # Cleanup on success: remove audio and soniox resources
+        # Cleanup on success
         if audio_path and audio_path.exists():
             audio_path.unlink(missing_ok=True)
         job["_audio_path"] = None
@@ -233,13 +309,19 @@ async def _run_transcription(job_id: str, api_key: str):
             job["_file_id"] = None
         if transcription_id:
             await client.delete_transcription(transcription_id)
+        if cookies_path and cookies_path.exists():
+            cookies_path.unlink(missing_ok=True)
+            job["_cookies_path"] = None
+        if uploaded_video_path and uploaded_video_path.exists():
+            uploaded_video_path.unlink(missing_ok=True)
+            job["_uploaded_video_path"] = None
 
     except Exception as e:
         logger.exception(f"Job {job_id} failed")
         job["error"] = str(e)
         _update_job_status(job_id, job, "error", f"Error: {e}")
-        # On error: keep audio_path and file_id so retry can resume
-        # Only clean up the failed transcription
+        # On error: keep audio/cookies/uploaded video so retry can resume.
+        # Only clean up the failed transcription.
         if transcription_id:
             await client.delete_transcription(transcription_id)
 
